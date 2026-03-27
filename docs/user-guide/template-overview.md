@@ -23,6 +23,10 @@ SPDX-License-Identifier: Apache-2.0
     - [Using the CLI](#using-the-cli)
     - [Using the REST API](#using-the-rest-api)
 
+**Prerequisites:** Familiarity with the [GitOps repository layout](./gitops-layout-and-setup.md)
+and [server onboarding](./server-onboarding-orig.md) process. Templates reference
+hardware resources and configuration defaults that are managed in the GitOps repository.
+
 ## ClusterTemplate CR
 
 A namespace-scoped CR that defines the resources and input parameters required for cluster provisioning. It is delivered via GitOps and reconciled by the O‑Cloud Manager.
@@ -58,6 +62,67 @@ The schema defined in the `templateParameterSchema` must include the following *
 - oCloudSiteId: Specifies the oCloud site identifier.
 - policyTemplateParameters: A subschema that defines the parameters for cluster configuration.
 - clusterInstanceParameters: A subschema for [ClusterInstance](https://github.com/stolostron/siteconfig/blob/main/config/crd/bases/siteconfig.open-cluster-management.io_clusterinstances.yaml), defining the parameters that are allowed in the ProvisioningRequest for cluster installation.
+
+The schema may also include the **optional** `hwTemplateParameters` property, which
+allows the ProvisioningRequest to override settings from the HardwareTemplate:
+
+- **`hwTemplateParameters.hardwareProvisioningTimeout`**: Override the hardware
+  provisioning timeout (e.g., `"120m"`).
+- **`hwTemplateParameters.nodeGroupData.<name>.hwProfile`**: Override the HardwareProfile
+  for a specific node group.
+- **`hwTemplateParameters.nodeGroupData.<name>.resourceSelector`**: Add or override
+  resource selector criteria for a specific node group. These are merged with the
+  selectors from the HardwareTemplate — existing criteria can be overridden by
+  specifying the same key, but cannot be removed.
+
+Using `hwTemplateParameters` overrides allows a single HardwareTemplate and
+ClusterTemplate to be shared across multiple deployments with different hardware
+configurations. Instead of creating separate templates for each server type, color, or
+firmware profile, you can define a base template with common settings and push the
+per-deployment specifics (such as server selection criteria and firmware profiles) into
+each ProvisioningRequest.
+
+For example, given a HardwareTemplate that selects XR8620t servers:
+
+```yaml
+# HardwareTemplate: xr8620t (shared across deployments)
+spec:
+  nodeGroupData:
+    - name: controller
+      role: master
+      resourceSelector:
+        "resourceselector.clcm.openshift.io/server-type": "XR8620t"
+  hardwareProvisioningTimeout: "90m"
+```
+
+Each ProvisioningRequest can then override settings as needed:
+
+```yaml
+# ProvisioningRequest: target a specific server, with a specific firmware profile
+spec:
+  templateParameters:
+    hwTemplateParameters:
+      hardwareProvisioningTimeout: "120m"
+      nodeGroupData:
+        controller:
+          hwProfile: rh-profile-xr8620t-idrac-7.20.30.50-bios-2.6.3
+          resourceSelector:
+            "resourceselector.clcm.openshift.io/server-id": "xr8620txdg16"
+```
+
+In this example, the ProvisioningRequest overrides the timeout, specifies the firmware
+profile, and narrows the BMH selection to a specific server — all without requiring a
+dedicated HardwareTemplate or ClusterTemplate.
+
+> [!NOTE]
+> The `hwProfile` must be specified either in the HardwareTemplate's
+> `nodeGroupData[].hwProfile` or via `hwTemplateParameters` in the ProvisioningRequest.
+> If both are omitted, provisioning will fail with a validation error. When using a
+> shared HardwareTemplate without a default `hwProfile`, every ProvisioningRequest must
+> include the `hwProfile` in its `hwTemplateParameters`.
+
+See the [hwTemplateSchema sample](../samples/hwTemplateSchema.yaml) for the schema
+definition of `hwTemplateParameters`.
 
 ### Hardware resources
 
