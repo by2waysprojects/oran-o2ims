@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -59,6 +60,8 @@ const (
 	OpAdd                                    = "add"
 	OpRemove                                 = "remove"
 	BmhServicingErr                          = "BMH Servicing Error"
+	IBIWarningAnnotation                     = "clcm.openshift.io/ibi-warning"
+	IBIWarningMessage                        = "Warning - this node was used for IBI and has been deprovisioned. BMH deletion and IBI reinstall is required before it can be used in a new cluster"
 )
 
 // Struct definitions for the nodelist configmap
@@ -1179,16 +1182,37 @@ func finalizeBMHDeallocation(ctx context.Context, c client.Client, logger *slog.
 		if !skipCleanAndPower {
 			// Clear CustomDeploy entirely
 			patched.Spec.CustomDeploy = nil
-			// Reset pre-provisioning data
-			patched.Spec.PreprovisioningNetworkDataName = BmhNetworkDataPrefx + "-" + bmh.Name
+			// Restore PreprovisioningNetworkDataName if it was cleared by a previous
+			// operator version during allocation. Only restore if the field is empty
+			// and a Secret with the expected name exists.
+			if patched.Spec.PreprovisioningNetworkDataName == "" {
+				expectedSecretName := BmhNetworkDataPrefx + "-" + bmh.Name
+				secret := &corev1.Secret{}
+				if err := c.Get(ctx, types.NamespacedName{
+					Name: expectedSecretName, Namespace: bmh.Namespace,
+				}, secret); err != nil {
+					if !k8serrors.IsNotFound(err) {
+						return fmt.Errorf("failed to get Secret %s/%s: %w", bmh.Namespace, expectedSecretName, err)
+					}
+				} else {
+					patched.Spec.PreprovisioningNetworkDataName = expectedSecretName
+					logger.InfoContext(ctx, "Restored PreprovisioningNetworkDataName",
+						slog.String("bmh", bmh.Name),
+						slog.String("secretName", expectedSecretName))
+				}
+			}
 			// Clear image reference
 			patched.Spec.Image = nil
 		}
-		if !skipCleanAndPower && bmh.Status.Provisioning.State == metal3v1alpha1.StateProvisioned {
+		if !skipCleanAndPower && (current.Status.Provisioning.State == metal3v1alpha1.StateProvisioned ||
+			current.Status.Provisioning.State == metal3v1alpha1.StateExternallyProvisioned) {
 			// Wipe partition tables using automated cleaning
 			patched.Spec.AutomatedCleaningMode = metal3v1alpha1.CleaningModeMetadata
 			// Power off the host
 			patched.Spec.Online = false
+		}
+		if !skipCleanAndPower && current.Spec.ExternallyProvisioned {
+			patched.Annotations[IBIWarningAnnotation] = IBIWarningMessage
 		}
 
 		// Patch changes
@@ -1302,7 +1326,7 @@ func clearBMHAnnotation(ctx context.Context, c client.Client, logger *slog.Logge
 	})
 }
 
-func patchOnlineFalse(ctx context.Context, c client.Client, bmh *metal3v1alpha1.BareMetalHost) error {
+func patchBMHOnline(ctx context.Context, c client.Client, bmh *metal3v1alpha1.BareMetalHost, online bool) error {
 	name := types.NamespacedName{Namespace: bmh.Namespace, Name: bmh.Name}
 	// nolint: wrapcheck
 	return retry.OnError(retry.DefaultRetry, k8serrors.IsConflict, func() error {
@@ -1311,7 +1335,7 @@ func patchOnlineFalse(ctx context.Context, c client.Client, bmh *metal3v1alpha1.
 			return err
 		}
 		patched := fresh.DeepCopy()
-		patched.Spec.Online = false
+		patched.Spec.Online = online
 
 		return c.Patch(ctx, patched, client.MergeFrom(&fresh))
 	})
